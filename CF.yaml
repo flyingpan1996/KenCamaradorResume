@@ -1,0 +1,201 @@
+Resources:
+  ResumeKenTechCS3:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: kentechc.ca
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  ResumeKenTechCBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket:
+        Ref: ResumeKenTechCS3
+      PolicyDocument:
+        Statement:
+          - Action:
+            - 's3:GetObject'
+            Effect: Allow
+            Resource:
+              'Fn::Join':
+                - ''
+                - - 'arn:aws:s3:::'
+                  - Ref: ResumeKenTechCS3
+                  - /*
+            Principal: '*'
+            Condition:
+              IpAddress:
+                'aws:SourceIp': '99.253.30.139/32'
+
+  ResumeVisitorCountDynamo:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: visitor_counter
+      AttributeDefinitions:
+        -
+          AttributeName: 'visit_count'
+          AttributeType: 'S'
+      KeySchema:
+        -
+          AttributeName: 'visit_count'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: '2'
+        WriteCapacityUnits: '2'
+
+  ResumeVisitorCountAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: 'visitor_counter'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ResumeVisitorCountAPIRootGet:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ResumeVisitorCountAPI
+      ResourceId: !GetAtt
+        - ResumeVisitorCountAPI
+        - RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+        IntegrationHttpMethod: POST
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResumeVisitorCountLambda.Arn}/invocations
+  ProdStageAPI:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: Prod
+      DeploymentId: !Ref APIDeployment
+      RestApiId: !Ref ResumeVisitorCountAPI
+
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ResumeVisitorCountAPIRootGet
+    Properties:
+      RestApiId: !Ref ResumeVisitorCountAPI
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ResumeVisitorCountLambda.Arn
+
+  ApiGatewayModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      ContentType: 'application/json'
+      RestApiId: !Ref ResumeVisitorCountAPI
+      Schema: {}
+
+  ResumeVisitorCountLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt LambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import decimal
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('visitor_counter')
+          try:
+            table.put_item(
+              Item={
+                'visit_count': 'visit_count',
+                  'visits': 0
+              },
+              ConditionExpression = "attribute_not_exists(visit_count)",
+            )
+          except dynamodb.meta.client.exceptions.ConditionalCheckFailedException as e:
+            print(e)
+          def replace_decimal(obj):
+              if isinstance(obj, list):
+                  for i in range(len(obj)):
+                      obj[i] = replace_decimal(obj[i])
+                  return obj
+              elif isinstance(obj, dict):
+                  for k, v in obj.items():
+                      obj[k] = replace_decimal(v)
+                  return obj
+              elif isinstance(obj, set):
+                  return set(replace_decimal(i) for i in obj)
+              elif isinstance(obj, decimal.Decimal):
+                  if obj % 1 == 0:
+                      return int(obj)
+                  else:
+                      return float(obj)
+              else:
+                  return obj
+          def lambda_handler(event, context):
+              response = table.update_item(
+                  Key={
+                      'visit_count': 'visit_count'
+                  },
+                  UpdateExpression='SET visits = visits + :inc',
+                  ExpressionAttributeValues={
+                      ':inc': 1
+                  },
+                  ReturnValues='UPDATED_NEW'
+              )
+              item = response['Attributes']
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET'
+                  },
+                  'body': json.dumps(replace_decimal(item))
+              }
+      TracingConfig:
+        Mode: Active
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DynamodbUpdateItem
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:PutItem"
+                Resource: !GetAtt ResumeVisitorCountDynamo.Arn
